@@ -1,6 +1,6 @@
-"""
-run_zeek_logs.py
+# run_zeek_logs.py
 
+"""
 Purpose
 -------
 Generate Zeek logs from one or more PCAP files in a consistent folder structure,

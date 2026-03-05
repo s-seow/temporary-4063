@@ -1,61 +1,25 @@
-#!/usr/bin/env python3
-"""
-llm_summarize_lateral.py
+# llm_summarize_lateral.py
 
-Purpose
--------
-Consumes the minimal outputs from lateral_detect.py:
+"""
+Consumes:
   - lateral_findings.json
   - evidence.csv
-…and produces LLM-written narrative outputs that are *evidence-bound*:
+Produces:
   - lateral_narrative.md
-  - lateral_summary.json  (same facts, better wording)
+  - lateral_summary.json
 
-Guardrails (hallucination control)
-----------------------------------
-1) The LLM is only given:
-   - findings JSON (structured)
-   - evidence rows (IDs + 5-tuples + timestamps + bytes/duration + line numbers)
-2) The LLM must cite evidence IDs like [EVID-0001] for every claim.
-3) We validate the output:
-   - every cited evidence ID must exist in evidence.csv
-   - if missing/invalid IDs are referenced, we fail (non-zero exit code)
-4) No step-by-step manual guidance is required during the run.
+Guardrails:
+- LLM only sees findings JSON + compact evidence lines
+- Every claim must cite [EVID-0001]
+- We validate that cited IDs exist in evidence.csv
 
 Supports:
-- OpenAI API (recommended)
-- Azure OpenAI (optional)
+- OpenAI (OPENAI_API_KEY, OPENAI_MODEL optional)
+- Azure OpenAI (AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT optional)
 
-Installation
-------------
-pip install openai
-
-Usage (OpenAI)
---------------
-export OPENAI_API_KEY="..."
-python llm_summarize_lateral.py \
-  --findings ./artifacts/<pcap_stem>/derived/lateral_findings.json \
-  --evidence ./artifacts/<pcap_stem>/derived/evidence.csv \
-  --out-dir  ./artifacts/<pcap_stem>/derived \
-  --model gpt-4.1-mini
-
-Usage (Azure OpenAI)
--------------------
-export AZURE_OPENAI_API_KEY="..."
-export AZURE_OPENAI_ENDPOINT="https://<resource-name>.openai.azure.com"
-export AZURE_OPENAI_API_VERSION="2024-10-21"
-python llm_summarize_lateral.py \
-  --findings ./artifacts/<pcap_stem>/derived/lateral_findings.json \
-  --evidence ./artifacts/<pcap_stem>/derived/evidence.csv \
-  --out-dir  ./artifacts/<pcap_stem>/derived \
-  --model <your-deployment-name> \
-  --provider azure
-
-Outputs
--------
-- lateral_narrative.md   (ready to paste into your Part 1/2 report)
-- lateral_summary.json   (structured, cleaned narrative + MITRE mapping text)
-
+.env loading:
+- This script auto-loads environment variables from a `.env` file located in the SAME directory as this script (repo root),
+  if present. Existing environment variables are NOT overridden.
 """
 
 from __future__ import annotations
@@ -73,7 +37,7 @@ from typing import Dict, List, Set, Tuple
 # --- LLM client (OpenAI Python SDK v1.x) ---
 try:
     from openai import OpenAI, AzureOpenAI
-except Exception as e:
+except Exception:
     OpenAI = None  # type: ignore
     AzureOpenAI = None  # type: ignore
 
@@ -97,6 +61,48 @@ class EvidenceRow:
     dst_port: str
     proto: str
     zeek_line_no: str
+    # DCERPC extras (blank for conn evidence)
+    dce_rpc_named_pipe: str
+    dce_rpc_endpoint: str
+    dce_rpc_operation: str
+
+
+def load_dotenv(dotenv_path: Path) -> None:
+    """
+    Minimal .env loader (no external dependency).
+    - Loads KEY=VALUE lines
+    - Ignores empty lines and comments starting with '#'
+    - Strips surrounding quotes from values
+    - Does NOT override existing environment variables
+    """
+    if not dotenv_path.exists() or not dotenv_path.is_file():
+        return
+
+    try:
+        for raw in dotenv_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+
+            if not key:
+                continue
+            if key in os.environ and os.environ[key].strip() != "":
+                continue  # do not override existing env vars
+
+            # Remove surrounding single/double quotes if present
+            if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
+                val = val[1:-1]
+
+            os.environ[key] = val
+    except Exception:
+        # If .env is malformed, fail silently (keeps runtime predictable).
+        return
 
 
 def load_json(path: Path) -> dict:
@@ -127,6 +133,9 @@ def load_evidence_csv(path: Path) -> Tuple[Dict[str, EvidenceRow], List[Evidence
                 dst_port=str(r.get("dst_port") or "").strip(),
                 proto=(r.get("proto") or "").strip(),
                 zeek_line_no=str(r.get("zeek_line_no") or "").strip(),
+                dce_rpc_named_pipe=(r.get("dce_rpc_named_pipe") or "").strip(),
+                dce_rpc_endpoint=(r.get("dce_rpc_endpoint") or "").strip(),
+                dce_rpc_operation=(r.get("dce_rpc_operation") or "").strip(),
             )
             rows_by_id[evid] = row
             rows_list.append(row)
@@ -135,17 +144,33 @@ def load_evidence_csv(path: Path) -> Tuple[Dict[str, EvidenceRow], List[Evidence
 
 def build_evidence_brief(rows: List[EvidenceRow], max_rows: int = 250) -> str:
     """
-    Create a compact evidence appendix for the LLM.
-    Keep it bounded: include only the most relevant evidence rows (first N).
+    Compact evidence appendix for the LLM.
+    Includes DCERPC fields when log_source is dce_rpc.log (or proto is dce_rpc).
     """
     rows = rows[:max_rows]
-    lines = []
+    lines: List[str] = []
+
     for r in rows:
-        lines.append(
+        base = (
             f"{r.evidence_id} | {r.ts_iso8601} | {r.five_tuple} | "
             f"dur={r.duration_sec}s bytes={r.total_bytes} state={r.conn_state} "
-            f"src={r.src_ip} dst={r.dst_ip}:{r.dst_port} log={r.log_source} line={r.zeek_line_no}"
+            f"src={r.src_ip} dst={r.dst_ip}:{r.dst_port} proto={r.proto} "
+            f"log={r.log_source} line={r.zeek_line_no}"
         )
+
+        if r.log_source.lower().startswith("dce_rpc") or r.proto.lower() == "dce_rpc":
+            extra = []
+            if r.dce_rpc_endpoint:
+                extra.append(f"endpoint={r.dce_rpc_endpoint}")
+            if r.dce_rpc_named_pipe:
+                extra.append(f"pipe={r.dce_rpc_named_pipe}")
+            if r.dce_rpc_operation:
+                extra.append(f"op={r.dce_rpc_operation}")
+            if extra:
+                base += " | " + " ".join(extra)
+
+        lines.append(base)
+
     return "\n".join(lines)
 
 
@@ -158,38 +183,39 @@ def validate_citations(text: str, valid_ids: Set[str]) -> Tuple[bool, List[str]]
 
 
 def make_prompt(findings: dict, evidence_brief: str) -> Tuple[str, str]:
-    """
-    Return (system_prompt, user_prompt).
-    """
     system_prompt = (
         "You are a digital forensics report writer focused on NETWORK PCAP evidence.\n"
         "You must be conservative, precise, and evidence-bound.\n"
         "CRITICAL RULES:\n"
         "1) You may ONLY use facts present in the provided JSON findings and evidence lines.\n"
         "2) Every factual claim must include at least one evidence citation like [EVID-0001].\n"
-        "3) Do NOT guess host roles (e.g., DC) unless supported by the evidence provided.\n"
+        "3) Do NOT guess host roles (e.g., Domain Controller) unless supported by evidence.\n"
         "4) If evidence is insufficient, explicitly say 'Insufficient evidence' and do not conclude.\n"
-        "5) Keep language professional and suitable for an investigation report.\n"
-        "6) Do not provide attack instructions; focus on what was observed.\n"
+        "5) Keep language professional for an investigation report.\n"
+        "6) Do not provide attack instructions; focus strictly on what was observed.\n"
     )
 
     user_prompt = (
         "TASK:\n"
-        "Write a 'Lateral Movement & Discovery' section for a Phase 1 network forensic report.\n\n"
+        "Write a 'Lateral Movement & Discovery' section for a network forensic report.\n\n"
+        "The analysis is based on:\n"
+        "- conn.log indicators (e.g., noisy scanning to ports 445/135)\n"
+        "- dce_rpc.log indicators (e.g., RPC operations suggestive of account creation or group modification)\n\n"
         "You are given:\n"
         "A) Structured findings JSON (from deterministic analytics)\n"
-        "B) Evidence lines (each with ID, timestamp, 5-tuple, bytes/duration, Zeek line numbers)\n\n"
+        "B) Evidence lines (each with ID, timestamp, 5-tuple, bytes/duration, Zeek line numbers; "
+        "DCERPC lines may include endpoint/pipe/operation fields)\n\n"
         "OUTPUT REQUIREMENTS:\n"
         "1) Produce Markdown with these headings:\n"
         "   - Overview\n"
         "   - Timeline (bullets with timestamps)\n"
         "   - Key Observations (what was seen + why it indicates discovery/lateral movement)\n"
-        "   - Affected Hosts (tables: suspected scanner(s) and top targets)\n"
+        "   - Affected Hosts (tables: suspected scanner(s) and key RPC pairs if relevant)\n"
         "   - MITRE ATT&CK Mapping (tactic/technique IDs; only if justified)\n"
         "   - Confidence & Limitations\n"
         "2) Every bullet/statement must contain at least one evidence citation: [EVID-0001]\n"
-        "3) Avoid naming specific tools unless the behavior explicitly supports it; use 'consistent with'.\n"
-        "4) Keep it concise but complete (around 300–700 words).\n\n"
+        "3) Avoid naming specific tools unless evidence explicitly supports it; use 'consistent with'.\n"
+        "4) Keep it concise but complete (around 300–800 words).\n\n"
         "FINDINGS JSON:\n"
         f"{json.dumps(findings, indent=2)}\n\n"
         "EVIDENCE LINES:\n"
@@ -202,7 +228,7 @@ def create_client(provider: str):
     if provider == "openai":
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if not api_key:
-            raise RuntimeError("Missing OPENAI_API_KEY environment variable.")
+            raise RuntimeError("Missing OPENAI_API_KEY environment variable (set it in .env or your shell).")
         if OpenAI is None:
             raise RuntimeError("openai Python package not installed. Run: pip install openai")
         return OpenAI(api_key=api_key)
@@ -220,9 +246,31 @@ def create_client(provider: str):
     raise ValueError("provider must be 'openai' or 'azure'")
 
 
-def call_llm(client, provider: str, model: str, system_prompt: str, user_prompt: str) -> str:
-    # Using Chat Completions style via responses API compatibility (SDK handles).
-    # Keep temperature low for reproducibility.
+def resolve_model(provider: str, cli_model: str) -> str:
+    """
+    OpenAI:
+      - uses --model if provided; else uses OPENAI_MODEL
+    Azure:
+      - uses --model if provided; else uses AZURE_OPENAI_DEPLOYMENT
+    """
+    m = (cli_model or "").strip()
+
+    if provider == "azure":
+        if not m:
+            m = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
+        if not m:
+            raise RuntimeError("For provider=azure, set AZURE_OPENAI_DEPLOYMENT or pass --model <deployment-name>.")
+        return m
+
+    # provider == openai
+    if not m:
+        m = os.getenv("OPENAI_MODEL", "").strip()
+    if not m:
+        raise RuntimeError("For provider=openai, pass --model <model-name> or set OPENAI_MODEL.")
+    return m
+
+
+def call_llm(client, model: str, system_prompt: str, user_prompt: str) -> str:
     resp = client.chat.completions.create(
         model=model,
         temperature=0.2,
@@ -245,11 +293,20 @@ def main() -> int:
     ap.add_argument("--evidence", required=True, help="Path to evidence.csv")
     ap.add_argument("--out-dir", required=True, help="Output directory (writes lateral_narrative.md, lateral_summary.json)")
     ap.add_argument("--provider", choices=["openai", "azure"], default="openai", help="LLM provider")
-    ap.add_argument("--model", required=True, help="Model name (OpenAI) or deployment name (Azure)")
+    ap.add_argument(
+        "--model",
+        default="",
+        help="OpenAI model name (OpenAI provider). Optional if OPENAI_MODEL is set. "
+             "For Azure, optional if AZURE_OPENAI_DEPLOYMENT is set.",
+    )
     ap.add_argument("--max-evidence-rows", type=int, default=250, help="Max evidence lines given to the LLM")
     ap.add_argument("--retry", type=int, default=1, help="Retry count if citation validation fails")
 
     args = ap.parse_args()
+
+    # Load .env from repo root (same directory as this script)
+    script_dir = Path(__file__).resolve().parent
+    load_dotenv(script_dir / ".env")
 
     findings_path = Path(args.findings).resolve()
     evidence_path = Path(args.evidence).resolve()
@@ -267,18 +324,23 @@ def main() -> int:
     evidence_brief = build_evidence_brief(evidence_rows, max_rows=args.max_evidence_rows)
     system_prompt, user_prompt = make_prompt(findings, evidence_brief)
 
+    try:
+        model_name = resolve_model(args.provider, args.model)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
     client = create_client(args.provider)
 
     last_text = ""
     for attempt in range(1, args.retry + 2):
-        text = call_llm(client, args.provider, args.model, system_prompt, user_prompt)
+        text = call_llm(client, model_name, system_prompt, user_prompt)
         last_text = text.strip()
 
         ok, missing = validate_citations(last_text, valid_ids)
         if ok:
             break
 
-        # If citations invalid, tighten instructions and retry
         if attempt <= args.retry + 1:
             user_prompt = (
                 user_prompt
@@ -291,24 +353,26 @@ def main() -> int:
     ok, missing = validate_citations(last_text, valid_ids)
     if not ok:
         print("ERROR: LLM output contains invalid evidence IDs:", missing, file=sys.stderr)
-        # Still write the raw output for debugging
         write_text(out_dir / "lateral_narrative.raw.md", last_text)
         return 1
 
-    # Write final markdown
     write_text(out_dir / "lateral_narrative.md", last_text + "\n")
 
-    # Also write a structured summary JSON that your report generator can use
     summary = {
         "module": "lateral_movement",
         "input_findings": str(findings_path),
         "input_evidence": str(evidence_path),
         "output_markdown": str((out_dir / "lateral_narrative.md").resolve()),
-        "model": args.model,
+        "model_or_deployment": model_name,
         "provider": args.provider,
+        "env_expected": {
+            "openai": ["OPENAI_API_KEY", "OPENAI_MODEL (optional)"],
+            "azure": ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_VERSION (optional)", "AZURE_OPENAI_DEPLOYMENT (optional)"],
+        },
         "notes": [
             "All statements in lateral_narrative.md must be backed by evidence IDs present in evidence.csv.",
             "If your narrative needs more context, increase --max-evidence-rows or improve the deterministic detector output.",
+            "This script loads a .env file from the repo root (same folder as this script) if present.",
         ],
     }
     write_text(out_dir / "lateral_summary.json", json.dumps(summary, indent=2) + "\n")
